@@ -10,8 +10,9 @@ use uuid::Uuid;
 
 use chrono::Utc;
 
-use crate::protocol::{ClientInfo, Message, Packet};
+use crate::protocol::{Message, Packet};
 
+mod diffie_hellman;
 mod protocol;
 
 /// Rastreia outros clientes localmente.
@@ -20,6 +21,14 @@ pub struct OtherClient {
     pub id: Uuid,
     pub nickname: Option<String>,
     pub is_online: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalClient {
+    pub id: Uuid,
+    pub nickname: Option<String>,
+    pub dh_public: diffie_hellman::Public,
+    pub dh_secret: diffie_hellman::Secret,
 }
 
 async fn setup_connection(
@@ -77,14 +86,22 @@ async fn main() -> anyhow::Result<()> {
 
     // gerar um UUIDv4 para esse cliente
     let id = Uuid::new_v4();
-    let client_info = ClientInfo {
+
+    let p: diffie_hellman::Modulus = 26;
+    let g: diffie_hellman::Base = diffie_hellman::rand_g();
+
+    let (dh_public, dh_secret) = diffie_hellman::make_keypair(p, g);
+
+    let local_client = LocalClient {
         id,
         nickname: nickname.clone(),
+        dh_public,
+        dh_secret,
     };
 
     println!(
-        "Connecting to {} with id {} nickname {:?}",
-        addr, id, nickname
+        "Connecting to {} with id {} nickname {:?}. Choosing public={}, secret={}",
+        addr, id, nickname, dh_public, dh_secret
     );
 
     let (packet_tx, mut packet_rx) = setup_connection(addr).await?;
@@ -99,7 +116,8 @@ async fn main() -> anyhow::Result<()> {
     // enviar pacote Join inicial
     packet_tx
         .send(Packet::Join {
-            client: client_info.clone(),
+            id: local_client.id.clone(),
+            nickname: local_client.nickname.clone(),
         })
         .ok();
 
@@ -154,6 +172,13 @@ async fn main() -> anyhow::Result<()> {
                 Packet::Error { reason } => {
                     eprintln!("Server error: {}", reason);
                     // o motivo pode variar... por enquanto, apenas printar
+                }
+                Packet::StartKeyUpdate {
+                    modulus: _,
+                    base: _,
+                    public: _,
+                } => {
+                    // o servidor nunca enviará esse pacote para um cliente; ignorar
                 }
                 Packet::Join { .. } => {
                     // o servidor nunca enviará esse pacote para um cliente; ignorar

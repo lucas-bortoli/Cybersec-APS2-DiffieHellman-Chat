@@ -1,3 +1,4 @@
+use std::any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -8,6 +9,7 @@ use uuid::Uuid;
 
 use crate::protocol::{ClientInfo, Packet};
 
+mod diffie_hellman;
 mod protocol;
 
 /// representação no lado servidor para um cliente conectado.
@@ -52,69 +54,11 @@ async fn main() -> anyhow::Result<()> {
 ///      os demais.
 async fn handle_connection(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
-    let mut lines = BufReader::new(reader).lines();
-
-    // ler a primeira linha; obrigatoriamente deve ser um Join
-    let first_line = match lines.next_line().await? {
-        Some(l) => l,
-        None => {
-            return Ok(());
-        }
-    };
-
-    let packet: Packet = match serde_json::from_str(&first_line) {
-        Ok(p) => p,
-        Err(_) => {
-            // erro ao parsear, fechar conex'ao
-            let mut w = writer;
-            let err = Packet::Error {
-                reason: "Invalid initial packet".into(),
-            };
-            let s = serde_json::to_string(&err)?;
-            w.write_all(s.as_bytes()).await?;
-            w.write_all(b"\n").await?;
-            return Ok(());
-        }
-    };
-
-    let join_info = match packet {
-        Packet::Join { client } => client,
-        _ => {
-            // Unexpected first packet
-            let mut w = writer;
-            let err = Packet::Error {
-                reason: "Expected Join packet as first packet".into(),
-            };
-            let s = serde_json::to_string(&err)?;
-            w.write_all(s.as_bytes()).await?;
-            w.write_all(b"\n").await?;
-            return Ok(());
-        }
-    };
-
-    // checar UUID duplicado
-    {
-        let map = state.lock().await;
-        if map.contains_key(&join_info.id) {
-            // duplicado, enviar um Error e fechar conex'ao
-            let mut w = writer;
-            let err = Packet::Error {
-                reason: "UUID already connected".into(),
-            };
-            let s = serde_json::to_string(&err)?;
-            w.write_all(s.as_bytes()).await?;
-            w.write_all(b"\n").await?;
-            println!("UUID duplicado rejeitado: {}", join_info.id);
-            return Ok(());
-        }
-    }
 
     // canal de envio de mensagens ao cliente
-    let (tx, mut rx) = mpsc::unbounded_channel::<Packet>();
-
-    // tarefa writer_task
+    let (write_queue_tx, mut write_queue_rx) = mpsc::unbounded_channel::<Packet>();
     let writer_task = tokio::spawn(async move {
-        while let Some(pkt) = rx.recv().await {
+        while let Some(pkt) = write_queue_rx.recv().await {
             if let Ok(msg) = serde_json::to_string(&pkt) {
                 if let Err(e) = writer.write_all(msg.as_bytes()).await {
                     eprintln!("Erro escrevendo dados para cliente: {:?}", e);
@@ -128,11 +72,67 @@ async fn handle_connection(stream: TcpStream, state: SharedState) -> anyhow::Res
         }
     });
 
+    // canal de recebimento de mensagens do cliente
+    let (read_queue_tx, mut read_queue_rx) = mpsc::unbounded_channel::<Packet>();
+    let reader_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+
+        // loop de leitura de pacotes vindos deste cliente
+        while let Ok(read_buf) = lines.next_line().await {
+            if let Some(line) = read_buf {
+                // ignorar linhas vazias
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                let pkt: Packet = match serde_json::from_str(&line) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("Pacote quebrado recebido: {:?}", e);
+                        continue;
+                    }
+                };
+
+                if let Err(_) = read_queue_tx.send(pkt) {
+                    break;
+                }
+            }
+        }
+    });
+
+    handle_connection_2(&write_queue_tx, &mut read_queue_rx, state).await?;
+
+    // dropar tx para que a writer_task finalize
+    drop(write_queue_tx);
+    writer_task.await.ok();
+    reader_task.await.ok();
+
+    Ok(())
+}
+
+async fn handle_connection_2(
+    write_packet: &mpsc::UnboundedSender<Packet>,
+    read_packet: &mut mpsc::UnboundedReceiver<Packet>,
+    state: SharedState,
+) -> anyhow::Result<()> {
+    let join_info = match read_packet.recv().await {
+        Some(Packet::Join { id, nickname }) => ClientInfo { id, nickname },
+        _ => {
+            // Unexpected first packet
+            let _ = write_packet.send(Packet::Error {
+                reason: "Expected Join packet as first packet".into(),
+            });
+            return Ok(());
+        }
+    };
+
+    println!("Conectado: {:?} ({})", join_info.nickname, join_info.id);
+
     // enviar lista atual de clientes antes de anunciar o novo clientet
     {
         let map = state.lock().await;
         let clients: Vec<ClientInfo> = map.values().map(|c| c.info.clone()).collect();
-        tx.send(Packet::ClientList { clients }).ok();
+        write_packet.send(Packet::ClientList { clients }).ok();
     }
 
     // registrar esse cliente no mapa global
@@ -140,7 +140,7 @@ async fn handle_connection(stream: TcpStream, state: SharedState) -> anyhow::Res
         let mut map = state.lock().await;
         let sc = ServerClient {
             info: join_info.clone(),
-            tx: tx.clone(),
+            tx: write_packet.clone(),
         };
         map.insert(join_info.id, sc);
     }
@@ -155,24 +155,8 @@ async fn handle_connection(stream: TcpStream, state: SharedState) -> anyhow::Res
     )
     .await;
 
-    println!("Conectado: {:?} ({})", join_info.nickname, join_info.id);
-
-    // loop de leitura de pacotes vindos deste cliente
-    while let Some(line) = lines.next_line().await? {
-        // ignorar linhas vazias
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let pkt: Packet = match serde_json::from_str(&line) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("Pacote quebrado recebido de {}: {:?}", join_info.id, e);
-                continue;
-            }
-        };
-
-        match pkt {
+    while let Some(packet) = read_packet.recv().await {
+        match packet {
             Packet::Chat { message } => {
                 // validação básica: garantir que message.author == join_info.id
                 if message.author != join_info.id {
@@ -187,7 +171,10 @@ async fn handle_connection(stream: TcpStream, state: SharedState) -> anyhow::Res
                 broadcast(&state, Packet::Chat { message }).await;
             }
             _ => {
-                eprintln!("Pacote inesperado do cliente {}: {:?}", join_info.id, pkt);
+                eprintln!(
+                    "Pacote inesperado do cliente {}: {:?}",
+                    join_info.id, packet
+                );
             }
         }
     }
@@ -213,10 +200,6 @@ async fn handle_connection(stream: TcpStream, state: SharedState) -> anyhow::Res
         join_info.nickname.unwrap_or_default(),
         join_info.id
     );
-
-    // dropar tx para que a writer_task finalize
-    drop(tx);
-    writer_task.await.ok();
 
     Ok(())
 }

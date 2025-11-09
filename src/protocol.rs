@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::diffie_hellman;
+
 /// Informação pública sobre um cliente compartilhada com os demais.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClientInfo {
@@ -22,7 +24,13 @@ pub struct Message {
 #[serde(tag = "type", content = "data")]
 pub enum Packet {
     /// Cliente envia essa mensagem ao se conectar. Um handshake.
-    Join { client: ClientInfo },
+    Join { id: Uuid, nickname: Option<String> },
+
+    StartKeyUpdate {
+        modulus: diffie_hellman::Modulus, // p
+        base: diffie_hellman::Base,       // g
+        public: diffie_hellman::Public, // a chave pública do remetent--- public = (g^(secret)) % p
+    },
 
     /// Servidor envia a lista de clientes atuais após aceitar conexão.
     ClientList { clients: Vec<ClientInfo> },
