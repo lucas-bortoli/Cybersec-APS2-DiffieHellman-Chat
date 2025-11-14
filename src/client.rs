@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -8,27 +9,29 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
-use chrono::Utc;
-
-use crate::protocol::{Message, Packet};
+use crate::diffie_hellman::{
+    Base, Modulus, Public, Secret, compute_shared_secret, make_keypair, rand_prime,
+};
+use crate::protocol::{ClientId, Packet};
 
 mod diffie_hellman;
 mod protocol;
+
+#[derive(Debug, Clone)]
+pub struct KeyInfo {
+    pub p: Modulus,
+    pub g: Base,
+    pub their_public: Public,
+    pub my_public: Public,
+    pub my_secret: Secret,
+}
 
 /// Rastreia outros clientes localmente.
 #[derive(Debug, Clone)]
 pub struct OtherClient {
     pub id: Uuid,
-    pub nickname: Option<String>,
-    pub is_online: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct LocalClient {
-    pub id: Uuid,
-    pub nickname: Option<String>,
-    pub dh_public: diffie_hellman::Public,
-    pub dh_secret: diffie_hellman::Secret,
+    pub nickname: String,
+    pub key_info: Option<KeyInfo>,
 }
 
 async fn setup_connection(
@@ -78,118 +81,14 @@ async fn setup_connection(
     Ok((sent_messages_tx, received_msgs_rx))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let addr = "127.0.0.1:8080";
-    let nickname = args.get(1).cloned();
-
-    // gerar um UUIDv4 para esse cliente
-    let id = Uuid::new_v4();
-
-    let p: diffie_hellman::Modulus = 26;
-    let g: diffie_hellman::Base = diffie_hellman::rand_g();
-
-    let (dh_public, dh_secret) = diffie_hellman::make_keypair(p, g);
-
-    let local_client = LocalClient {
-        id,
-        nickname: nickname.clone(),
-        dh_public,
-        dh_secret,
-    };
-
-    println!(
-        "Connecting to {} with id {} nickname {:?}. Choosing public={}, secret={}",
-        addr, id, nickname, dh_public, dh_secret
-    );
-
-    let (packet_tx, mut packet_rx) = setup_connection(addr).await?;
-
-    // mapa de outros clientes
-    let other_clients: Arc<Mutex<HashMap<Uuid, OtherClient>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    // task de leitura de linhas do socket
-    let others_for_read = other_clients.clone();
-
-    // enviar pacote Join inicial
-    packet_tx
-        .send(Packet::Join {
-            id: local_client.id.clone(),
-            nickname: local_client.nickname.clone(),
-        })
-        .ok();
-
-    // task de processamento de packets do servidor
-    let others_handler = others_for_read.clone();
-    tokio::spawn(async move {
-        while let Some(pkt) = packet_rx.recv().await {
-            match pkt {
-                Packet::ClientList { clients } => {
-                    // popular mapa de clientes, marcando-os online
-                    let mut map = others_handler.lock().await;
-                    for c in clients {
-                        map.entry(c.id)
-                            .or_insert(OtherClient {
-                                id: c.id,
-                                nickname: c.nickname.clone(),
-                                is_online: true,
-                            })
-                            .is_online = true;
-                    }
-                    print_known_clients(&map);
-                }
-                Packet::ClientStatus { client, is_online } => {
-                    let mut map = others_handler.lock().await;
-                    let entry = map.entry(client.id).or_insert(OtherClient {
-                        id: client.id,
-                        nickname: client.nickname.clone(),
-                        is_online,
-                    });
-                    // atualizar nickname (o servidor sempre o reenvia)
-                    entry.nickname = client.nickname.clone();
-                    entry.is_online = is_online;
-                    println!(
-                        "ClientStatus: {} is_online={}",
-                        entry.nickname.clone().unwrap_or_default(),
-                        is_online
-                    );
-                }
-                Packet::Chat { message } => {
-                    let map = others_handler.lock().await;
-                    let nick = map
-                        .get(&message.author)
-                        .and_then(|c| c.nickname.clone())
-                        .unwrap_or_else(|| message.author.to_string());
-                    println!(
-                        "[{}] {}: {}",
-                        message.send_date.to_rfc3339(),
-                        nick,
-                        message.content
-                    );
-                }
-                Packet::Error { reason } => {
-                    eprintln!("Server error: {}", reason);
-                    // o motivo pode variar... por enquanto, apenas printar
-                }
-                Packet::StartKeyUpdate {
-                    modulus: _,
-                    base: _,
-                    public: _,
-                } => {
-                    // o servidor nunca enviará esse pacote para um cliente; ignorar
-                }
-                Packet::Join { .. } => {
-                    // o servidor nunca enviará esse pacote para um cliente; ignorar
-                }
-            }
-        }
-    });
-
-    // loop principal: ler do stdin e enviar mensagens
-    let my_id = id;
-
+async fn ui_thread(
+    my_client_id: ClientId,
+    my_nickname: String,
+    p: Modulus,
+    g: Base,
+    packet_tx: mpsc::UnboundedSender<Packet>,
+    other_clients: Arc<Mutex<HashMap<ClientId, OtherClient>>>,
+) -> anyhow::Result<()> {
     println!("Bem-vindo! Você pode enviar mensagens. Ctrl+C para sair.");
     let stdin = io::stdin();
     loop {
@@ -205,30 +104,177 @@ async fn main() -> anyhow::Result<()> {
         if msg.is_empty() {
             continue;
         }
-        let message = Message {
-            content: msg,
-            author: my_id,
-            send_date: Utc::now(),
-        };
 
-        if let Err(e) = packet_tx.send(Packet::Chat { message }) {
-            println!("Erro ao enviar mensagem: {}", e);
-            break;
+        // problema autal: other_clients é sempre vazio, já que não tem mecanismo para discovery ainda...
+
+        for client in other_clients.lock().await.values() {
+            println!("Enviando para {}", client.id);
+            let (my_public, my_secret) = make_keypair(p, g);
+
+            packet_tx
+                .send(Packet::KeyUpdateStart {
+                    sender: my_client_id,
+                    modulus: p,
+                    base: g,
+                    public: my_public,
+                })
+                .ok();
+
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            packet_tx
+                .send(Packet::CipheredMessage {
+                    sender: my_client_id,
+                    nickname: my_nickname.clone(),
+                    intended_receiver: client.id,
+                    content_blob: msg.as_bytes().to_vec(),
+                })
+                .ok();
         }
     }
 
-    println!("Fechando.");
     Ok(())
 }
 
-fn print_known_clients(map: &HashMap<Uuid, OtherClient>) {
-    println!("Outros usuários ({}):", map.len());
-    for (_, c) in map.iter() {
-        println!(
-            " - {} [{}] online={}",
-            c.nickname.clone().unwrap_or_else(|| c.id.to_string()),
-            c.id,
-            c.is_online
-        );
-    }
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let addr = "127.0.0.1:8080";
+
+    // gerar um UUIDv4 para esse cliente
+    let my_id = Uuid::new_v4();
+    let nickname = args.get(1).cloned().unwrap_or(my_id.to_string());
+    let (p, g): (Modulus, Base) = (26, rand_prime());
+
+    println!("connect id={} nick={:?}, p={}, g={}", my_id, nickname, p, g);
+
+    let (packet_tx, mut packet_rx) = setup_connection(addr).await?;
+
+    // mapa de outros clientes
+    let other_clients: Arc<Mutex<HashMap<ClientId, OtherClient>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let ui_other_clients = other_clients.clone();
+
+    // enviar pacote Join inicial
+    packet_tx
+        .send(Packet::Join {
+            sender: my_id.clone(),
+            nickname: nickname.clone(),
+        })
+        .ok();
+
+    // task de processamento de packets do servidor
+    let packet_tx_t = packet_tx.clone();
+    tokio::spawn(async move {
+        while let Some(pkt) = packet_rx.recv().await {
+            //  println!("{:?}", pkt);
+            match pkt {
+                Packet::Join { sender, nickname } => {
+                    // significa que outro client acabou de conectar
+                    let mut map = other_clients.lock().await;
+                    let other_client = OtherClient {
+                        id: sender,
+                        nickname,
+                        key_info: None,
+                    };
+                    map.insert(sender, other_client);
+                }
+                Packet::Leave { sender } => {
+                    let mut map = other_clients.lock().await;
+                    map.remove(&sender);
+                }
+                Packet::KeyUpdateStart {
+                    sender,
+                    modulus,
+                    base,
+                    public: their_public,
+                } => {
+                    let mut clients = other_clients.lock().await;
+
+                    match clients.get_mut(&sender) {
+                        Some(sender_info) => {
+                            let (my_public, my_secret) = make_keypair(modulus, base);
+
+                            let our_secret =
+                                compute_shared_secret(modulus, my_secret, their_public);
+
+                            println!(
+                                "Aceitando renegociação da chave com o cliente {}: p={}, g={}, their_public={}, my_public={}, our_secret={}",
+                                sender, modulus, base, their_public, my_public, our_secret
+                            );
+
+                            // ... armazenar novos valores
+                            sender_info.key_info = Some(KeyInfo {
+                                p: modulus,
+                                g: base,
+                                their_public: their_public,
+                                my_public: my_public,
+                                my_secret: my_secret,
+                            });
+
+                            // ... enviar nossa nova public   pra ele
+                            packet_tx_t
+                                .send(Packet::KeyUpdateReply {
+                                    sender: my_id,
+                                    intended_receiver: sender,
+                                    public: my_public,
+                                })
+                                .ok();
+                        }
+                        None => {}
+                    }
+                }
+                Packet::KeyUpdateReply {
+                    sender,
+                    intended_receiver,
+                    public: new_public,
+                } => {
+                    if intended_receiver != my_id {
+                        // mensagem não é direcionada a nós
+                        continue;
+                    }
+
+                    let mut clients = other_clients.lock().await;
+                    if let Some(sender_info) = clients.get_mut(&sender) {
+                        if let Some(key_info) = &mut sender_info.key_info {
+                            key_info.their_public = new_public;
+                            println!("Nova chave pública de {}: {}", sender, new_public);
+                        }
+                    }
+                }
+                Packet::CipheredMessage {
+                    sender: _,
+                    nickname,
+                    intended_receiver,
+                    content_blob,
+                } => {
+                    if intended_receiver != my_id {
+                        // mensagem não é direcionada a nós
+                        continue;
+                    }
+
+                    //let map = other_clients.lock().await;
+                    println!(
+                        "[{}]: {}",
+                        nickname,
+                        String::from_utf8(content_blob).unwrap()
+                    );
+                }
+            }
+        }
+    });
+
+    // loop principal: ler do stdin e enviar mensagens;
+    ui_thread(
+        my_id.clone(),
+        nickname.clone(),
+        p,
+        g,
+        packet_tx.clone(),
+        ui_other_clients,
+    )
+    .await?;
+
+    println!("Fechando.");
+    Ok(())
 }

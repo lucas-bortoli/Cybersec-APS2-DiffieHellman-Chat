@@ -31,7 +31,7 @@ fn mod_exp(base: u64, exp: u64, modulo: u64) -> u64 {
     return resultado;
 }
 
-pub fn rand_g() -> Base {
+pub fn rand_prime() -> u64 {
     *PRIMES.choose(&mut rand::rng()).unwrap()
 }
 

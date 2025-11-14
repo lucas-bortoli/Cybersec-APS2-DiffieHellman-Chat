@@ -1,4 +1,3 @@
-use std::any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -7,14 +6,15 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
-use crate::protocol::{ClientInfo, Packet};
+use crate::protocol::{ClientId, Packet};
 
 mod diffie_hellman;
 mod protocol;
 
 /// representação no lado servidor para um cliente conectado.
 struct ServerClient {
-    info: ClientInfo,
+    id: ClientId,
+    nickname: String,
     /// `tx` é usado para enviar linhas JSON para esse cliente
     tx: mpsc::UnboundedSender<Packet>,
 }
@@ -115,100 +115,77 @@ async fn handle_connection_2(
     read_packet: &mut mpsc::UnboundedReceiver<Packet>,
     state: SharedState,
 ) -> anyhow::Result<()> {
-    let join_info = match read_packet.recv().await {
-        Some(Packet::Join { id, nickname }) => ClientInfo { id, nickname },
+    let (client_id, nickname) = match read_packet.recv().await {
+        Some(Packet::Join { sender, nickname }) => (sender, nickname),
         _ => {
             // Unexpected first packet
-            let _ = write_packet.send(Packet::Error {
-                reason: "Expected Join packet as first packet".into(),
-            });
             return Ok(());
         }
     };
 
-    println!("Conectado: {:?} ({})", join_info.nickname, join_info.id);
-
-    // enviar lista atual de clientes antes de anunciar o novo clientet
-    {
-        let map = state.lock().await;
-        let clients: Vec<ClientInfo> = map.values().map(|c| c.info.clone()).collect();
-        write_packet.send(Packet::ClientList { clients }).ok();
-    }
-
     // registrar esse cliente no mapa global
     {
         let mut map = state.lock().await;
+
         let sc = ServerClient {
-            info: join_info.clone(),
+            id: client_id.clone(),
+            nickname: nickname.clone(),
             tx: write_packet.clone(),
         };
-        map.insert(join_info.id, sc);
+
+        // anunciar a conexão para os outros clients
+        for other_client in map.values() {
+            other_client
+                .tx
+                .send(Packet::Join {
+                    sender: client_id.clone(),
+                    nickname: nickname.clone(),
+                })
+                .ok();
+
+            // enviar um pacote "fake" de join, para que este client saiba quais estão conectados na room
+            write_packet
+                .send(Packet::Join {
+                    sender: other_client.id.clone(),
+                    nickname: other_client.nickname.clone(),
+                })
+                .ok();
+        }
+
+        map.insert(client_id, sc);
     }
 
-    // notificar a todos a entrada deste cliente
-    broadcast(
-        &state,
-        Packet::ClientStatus {
-            client: join_info.clone(),
-            is_online: true,
-        },
-    )
-    .await;
+    println!("Conectado: {:?} ({})", nickname, client_id);
 
     while let Some(packet) = read_packet.recv().await {
-        match packet {
-            Packet::Chat { message } => {
-                // validação básica: garantir que message.author == join_info.id
-                if message.author != join_info.id {
-                    eprintln!(
-                        "Id do remetente inválido: esperava {}, recebeyu {}",
-                        join_info.id, message.author
-                    );
-                    // ignorar mensagem
-                    continue;
-                }
-                // enviar mensagem a todos, inclusive o remetente original
-                broadcast(&state, Packet::Chat { message }).await;
-            }
-            _ => {
-                eprintln!(
-                    "Pacote inesperado do cliente {}: {:?}",
-                    join_info.id, packet
-                );
-            }
-        }
+        println!("Pacote de {}: {:?}", client_id, packet);
+        broadcast(&state, packet).await;
     }
 
     // este cliente desconectou: remover do estado...
     {
         let mut map = state.lock().await;
-        map.remove(&join_info.id);
+        map.remove(&client_id);
     }
 
-    // ...e notificar todos os outros clientes
     broadcast(
         &state,
-        Packet::ClientStatus {
-            client: join_info.clone(),
-            is_online: false,
+        Packet::Leave {
+            sender: client_id.clone(),
         },
     )
     .await;
 
-    println!(
-        "Cliente desconectou: {} ({})",
-        join_info.nickname.unwrap_or_default(),
-        join_info.id
-    );
+    println!("Cliente desconectou: {} ({})", nickname, client_id);
 
     Ok(())
 }
 
-/// Faz o broadcast de um pacote a todos os clientes conectados
+/// faz o broadcast de um pacote a todos os clientes conectados
 async fn broadcast(state: &SharedState, packet: Packet) {
     let map = state.lock().await;
     for (_id, sc) in map.iter() {
-        // It's fine if send fails (client writer closed), ignore.
+        // it's fine if send fails (client writer closed), ignore.
         let _ = sc.tx.send(packet.clone());
     }
 }
