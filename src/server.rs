@@ -119,6 +119,7 @@ async fn handle_connection_2(
         Some(Packet::Join { sender, nickname }) => (sender, nickname),
         _ => {
             // Unexpected first packet
+            println!("Primeiro pacote inesperado do cliente.");
             return Ok(());
         }
     };
