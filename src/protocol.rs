@@ -52,7 +52,7 @@ pub enum Packet {
         sender: ClientId,
         nickname: String,
         intended_receiver: ClientId,
-        content_blob: Vec<u8>,
+        content_blob: String,
     },
 }
 
@@ -67,8 +67,8 @@ pub enum RoundtripError {
 
 pub struct Roundtrip {
     pub my_id: ClientId,
+    pub ch_sender: mpsc::UnboundedSender<Packet>,
 
-    ch_sender: mpsc::UnboundedSender<Packet>,
     ch_receiver: mpsc::UnboundedReceiver<Packet>,
 
     sender_task_handle: Option<JoinHandle<Result<(), RoundtripError>>>,
@@ -92,7 +92,7 @@ impl Roundtrip {
         let (sent_messages_tx, mut sent_messages_rx) = mpsc::unbounded_channel::<Packet>();
         let sender_task_handle = tokio::spawn(async move {
             while let Some(packet) = sent_messages_rx.recv().await {
-                println!("Sending {:?}", packet);
+                //  println!("Sending {:?}", packet);
                 match serde_json::to_string(&packet) {
                     Ok(line) => {
                         if let Err(e) = socket_writer.write_all(line.as_bytes()).await {
@@ -122,7 +122,7 @@ impl Roundtrip {
                     return Err(RoundtripError::ProtocolError());
                 }
 
-                println!("Received {:?}", line);
+                //  println!("Received {:?}", line);
 
                 if let Ok(received_packet) = serde_json::from_str::<Packet>(&line) {
                     // pacote válido recebido

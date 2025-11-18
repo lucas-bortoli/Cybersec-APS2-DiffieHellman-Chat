@@ -42,16 +42,6 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Lida com uma conexão de cliente.
-/// 1. ler a primeira linha (JSON) esperando um Packet::Join
-/// 2. se o UUID for duplicado, enviar Packet::Error e fechar conexão.
-/// 3. caso contrário:
-///    - cria uma tarefa de escrita que consome um canal mpsc
-///      e escreve linhas JSON para o socket
-///    - envia o Packet::ClientList com todos os clientes conectados atualmente
-///    - adiciona esse cliente ao estado compartilhado
-///    - transmite o Packet::ClientStatus (is_online=true) para os outros clientes
-///    - Lê linhas vindas do cliente: espera por Packet::Chat e retransmite para
-///      os demais.
 async fn handle_connection(stream: TcpStream, state: SharedState) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
 
@@ -59,14 +49,21 @@ async fn handle_connection(stream: TcpStream, state: SharedState) -> anyhow::Res
     let (write_queue_tx, mut write_queue_rx) = mpsc::unbounded_channel::<Packet>();
     let writer_task = tokio::spawn(async move {
         while let Some(pkt) = write_queue_rx.recv().await {
-            if let Ok(msg) = serde_json::to_string(&pkt) {
-                if let Err(e) = writer.write_all(msg.as_bytes()).await {
-                    eprintln!("Erro escrevendo dados para cliente: {:?}", e);
-                    break;
+            match serde_json::to_string(&pkt) {
+                Ok(msg) => {
+                    if let Err(e) = writer.write_all(msg.as_bytes()).await {
+                        eprintln!("Erro escrevendo dados para cliente: {:?}", e);
+                        break;
+                    }
+                    if let Err(e) = writer.write_all(b"\n").await {
+                        eprintln!("Erro escrevendo nova linha para cliente: {:?}", e);
+                        break;
+                    }
                 }
-                if let Err(e) = writer.write_all(b"\n").await {
-                    eprintln!("Erro escrevendo nova linha para cliente: {:?}", e);
-                    break;
+                Err(e) => {
+                    eprintln!("Erro serializando pacote para cliente: {:?}", e);
+                    // If serialization fails, skip this packet and continue
+                    continue;
                 }
             }
         }
@@ -77,23 +74,32 @@ async fn handle_connection(stream: TcpStream, state: SharedState) -> anyhow::Res
     let reader_task = tokio::spawn(async move {
         let mut lines = BufReader::new(reader).lines();
 
-        // loop de leitura de pacotes vindos deste cliente
-        while let Ok(read_buf) = lines.next_line().await {
-            if let Some(line) = read_buf {
-                // ignorar linhas vazias
-                if line.trim().is_empty() {
-                    continue;
-                }
-
-                let pkt: Packet = match serde_json::from_str(&line) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("Pacote quebrado recebido: {:?}", e);
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if line.trim().is_empty() {
                         continue;
                     }
-                };
 
-                if let Err(_) = read_queue_tx.send(pkt) {
+                    match serde_json::from_str::<Packet>(&line) {
+                        Ok(pkt) => {
+                            if read_queue_tx.send(pkt).is_err() {
+                                // receiver dropped -> stop reading
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Pacote quebrado recebido: {:?}", e);
+                            continue;
+                        }
+                    }
+                }
+                Ok(None) => {
+                    // EOF from client
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("Erro lendo do socket: {:?}", e);
                     break;
                 }
             }
@@ -117,9 +123,13 @@ async fn handle_connection_2(
 ) -> anyhow::Result<()> {
     let (client_id, nickname) = match read_packet.recv().await {
         Some(Packet::Join { sender, nickname }) => (sender, nickname),
-        _ => {
-            // Unexpected first packet
-            println!("Primeiro pacote inesperado do cliente.");
+        Some(other) => {
+            println!("Primeiro pacote inesperado do cliente: {:?}", other);
+            return Ok(());
+        }
+        None => {
+            // client closed immediately
+            println!("Cliente desconectou antes de enviar Join.");
             return Ok(());
         }
     };
@@ -127,6 +137,11 @@ async fn handle_connection_2(
     // registrar esse cliente no mapa global
     {
         let mut map = state.lock().await;
+
+        if map.len() == 2 {
+            map.clear();
+            // TODO remover
+        }
 
         let sc = ServerClient {
             id: client_id.clone(),
@@ -136,6 +151,7 @@ async fn handle_connection_2(
 
         // anunciar a conexão para os outros clients
         for other_client in map.values() {
+            // inform other clients that this new client has joined
             other_client
                 .tx
                 .send(Packet::Join {
@@ -144,7 +160,7 @@ async fn handle_connection_2(
                 })
                 .ok();
 
-            // enviar um pacote "fake" de join, para que este client saiba quais estão conectados na room
+            // send an existing-client Join to the new client so it knows who's in the room
             write_packet
                 .send(Packet::Join {
                     sender: other_client.id.clone(),
@@ -153,10 +169,11 @@ async fn handle_connection_2(
                 .ok();
         }
 
-        map.insert(client_id, sc);
+        // Insert using a clone so we can still use client_id afterwards
+        map.insert(client_id.clone(), sc);
     }
 
-    println!("Conectado: {:?} ({})", nickname, client_id);
+    println!("Conectado: {} ({})", nickname, client_id);
 
     while let Some(packet) = read_packet.recv().await {
         println!("Pacote de {}: {:?}", client_id, packet);

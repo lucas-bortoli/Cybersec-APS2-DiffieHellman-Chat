@@ -1,37 +1,26 @@
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
-use crate::diffie_hellman::{
-    Base, Modulus, Public, Secret, compute_shared_secret, make_keypair, rand_prime,
-};
+use crate::caesar_cipher::Caesar;
+use crate::diffie_hellman::{Base, Modulus, Public, Secret, compute_shared_secret, make_keypair};
 use crate::protocol::{ClientId, Packet, Roundtrip};
 
+mod caesar_cipher;
 mod diffie_hellman;
 mod protocol;
-
-#[derive(Debug, Clone)]
-pub struct KeyInfo {
-    pub p: Modulus,
-    pub g: Base,
-    pub their_public: Public,
-    pub my_public: Public,
-    pub my_secret: Secret,
-}
 
 /// Rastreia outros clientes localmente.
 #[derive(Debug, Clone)]
 pub struct OtherClient {
     pub id: Uuid,
     pub nickname: String,
-    pub key_info: Option<KeyInfo>,
+    pub my_keys: (Modulus, Base, Public, Secret),
+    pub their_pub: Option<Public>,
 }
 
 async fn handle_packet(
@@ -43,17 +32,33 @@ async fn handle_packet(
 ) {
     match packet {
         Packet::Join { sender, nickname } => {
+            if sender == *my_id {
+                return;
+            }
+
+            eprintln!("Join: {}", sender);
+
+            let (modulus, base) = (diffie_hellman::rand_prime(), diffie_hellman::rand_prime());
+            let (my_public, my_secret) = diffie_hellman::make_keypair(modulus, base);
+
             let mut map = other_clients.write().await;
             map.insert(
                 sender,
                 OtherClient {
                     id: sender,
                     nickname,
-                    key_info: None,
+                    my_keys: (modulus, base, my_public, my_secret),
+                    their_pub: None,
                 },
             );
         }
         Packet::Leave { sender } => {
+            if sender == *my_id {
+                return;
+            }
+
+            eprintln!("Leave: {}", sender);
+
             let mut map = other_clients.write().await;
             map.remove(&sender);
         }
@@ -63,61 +68,66 @@ async fn handle_packet(
             base,
             public: their_new_public,
         } => {
-            let mut clients = other_clients.write().await;
-            match clients.get_mut(&sender) {
-                Some(sender_info) => {
-                    let (my_public, my_secret) = make_keypair(modulus, base);
-
-                    let our_secret = compute_shared_secret(modulus, my_secret, their_new_public);
-
-                    println!(
-                        "Aceitando renegociação da chave com o cliente {}: p={}, g={}, their_new_public={}, my_public={}, our_secret={}",
-                        sender, modulus, base, their_new_public, my_public, our_secret
-                    );
-
-                    // ... armazenar novos valores
-                    sender_info.key_info = Some(KeyInfo {
-                        p: modulus,
-                        g: base,
-                        their_public: their_new_public,
-                        my_public: my_public,
-                        my_secret: my_secret,
-                    });
-
-                    // ... enviar nossa nova publica pra ele
-                    roundtrip
-                        .send_simple_packet(Packet::KeyUpdateReply {
-                            sender: my_id.clone(),
-                            intended_receiver: sender,
-                            public: my_public,
-                        })
-                        .await;
-                }
-                None => {
-                    // o cliente não existe, ignorar
-                    eprintln!(
-                        "recebi um pacote KeyUpdateStart de um cliente que não estava no mapa. packet={:?}, clientes={:?}",
-                        packet, other_clients
-                    );
-                }
+            if sender == *my_id {
+                return;
             }
+
+            eprintln!("KeyUpdateStart: {}", sender);
+            // First phase: compute values and update local state without awaiting.
+            let my_public = {
+                let mut clients = other_clients.write().await;
+
+                match clients.get_mut(&sender) {
+                    Some(sender_info) => {
+                        let (my_public, my_secret) = make_keypair(modulus, base);
+                        let our_secret =
+                            compute_shared_secret(modulus, my_secret, their_new_public);
+
+                        sender_info.my_keys = (modulus, base, my_public, my_secret);
+                        sender_info.their_pub = Some(their_new_public);
+
+                        println!(
+                            "renegociação da chave aceita {}: p={}, g={}, their_new_public={}, my_public={}, our_secret={}",
+                            sender, modulus, base, their_new_public, my_public, our_secret
+                        );
+
+                        my_public
+                    }
+                    None => {
+                        eprintln!(
+                            "recebi um pacote KeyUpdateStart de um cliente que não estava no mapa. packet={:?}",
+                            packet
+                        );
+                        return;
+                    }
+                }
+            };
+
+            // enviar pacote de resposta. já atualizamos nosso estado, agora é trabalho do remetente atualizar seu estado com nossas novas informações.
+            roundtrip
+                .send_simple_packet(Packet::KeyUpdateReply {
+                    sender: my_id.clone(),
+                    intended_receiver: sender,
+                    public: my_public,
+                })
+                .await;
         }
         Packet::KeyUpdateReply {
             sender,
             intended_receiver,
             public: new_public,
         } => {
-            if intended_receiver != *my_id {
+            if sender == *my_id || intended_receiver != *my_id {
                 // mensagem não é direcionada a nós
                 return;
             }
 
+            eprintln!("KeyUpdateReply: {}", sender);
+
             let mut clients = other_clients.write().await;
             if let Some(sender_info) = clients.get_mut(&sender) {
-                if let Some(key_info) = &mut sender_info.key_info {
-                    key_info.their_public = new_public;
-                    println!("Nova chave pública de {}: {}", sender, new_public);
-                }
+                println!("nova chave pública de {}: {}", sender, new_public);
+                sender_info.their_pub = Some(new_public);
             }
         }
         Packet::CipheredMessage {
@@ -126,17 +136,40 @@ async fn handle_packet(
             intended_receiver,
             content_blob,
         } => {
-            if intended_receiver != *my_id {
+            if sender == *my_id || intended_receiver != *my_id {
                 // mensagem não é direcionada a nós
                 return;
             }
 
-            //let map = other_clients.lock().await;
-            println!(
-                "[{}]: {}",
-                nickname,
-                String::from_utf8(content_blob).unwrap()
-            );
+            eprintln!("CipheredMessage: {}", sender);
+
+            let clients = other_clients.read().await;
+
+            if let Some(sender) = clients.get(&sender) {
+                if let Some(their_pub) = sender.their_pub {
+                    println!("recebimento: {:?}, their_pub={}", sender.my_keys, their_pub);
+
+                    let (modulus, _, _, my_secret) = sender.my_keys;
+
+                    let our_shared_secret =
+                        diffie_hellman::compute_shared_secret(modulus, my_secret, their_pub);
+
+                    let k = (our_shared_secret % 26).try_into().unwrap();
+                    println!("decode key={}", our_shared_secret);
+                    let decoded = Caesar::decrypt(k, &content_blob);
+
+                    println!("[{}]: {}", sender.nickname, decoded);
+                } else {
+                    // a mensagem foi recebida, mas NÃO HOUVE um handshake de senhas. então o conteúdo da mensagem é desconhecido.
+                    // mostrar o conteúdo desconhecido, mesmo assim.
+                    eprintln!("[{}] (???): {:?}", sender.nickname, content_blob);
+                }
+            } else {
+                eprintln!(
+                    "Mensagem recebida, de um remetente desconhecido: {:?}",
+                    sender
+                );
+            }
         }
     }
 }
@@ -144,54 +177,93 @@ async fn handle_packet(
 async fn handle_message_send(
     my_id: &Uuid,
     nickname: &str,
-    roundtrip: &mut Roundtrip,
-    other_clients: &tokio::sync::RwLock<HashMap<ClientId, OtherClient>>,
+    tx: UnboundedSender<Packet>,
+    other_clients: Arc<tokio::sync::RwLock<HashMap<ClientId, OtherClient>>>,
     message: &str,
 ) {
     let (p, g) = (diffie_hellman::rand_prime(), diffie_hellman::rand_prime());
 
-    // aqui precisamos cumprir o requisito da atividade:
-    // 1. decidir novos parâmetros de p e g (módulo e base, respectivamente)
-    // 2. computar uma nova chave pública e privada
-    // 3. computar uma chave secreta coordenada (...que será a chave da cifra de César)
-    // 4. finalmente, encodar a mensagem com a chave secreta coordenada e enviar cifrada.
-    // o problema é que temos um "handshake" aqui. aí é foda.
+    let clients = other_clients.read().await;
+    let clients_copy = clients.clone();
+    drop(clients);
 
-    // problema autal: other_clients é sempre vazio, já que não tem mecanismo para discovery ainda...
-
-    for client in other_clients.read().await.values() {
-        println!("Enviando para {}", client.id);
+    for client in clients_copy.values() {
+        // criar um novo keypar para esse handshake
         let (my_public, my_secret) = make_keypair(p, g);
 
-        roundtrip
-            .send_simple_packet(Packet::KeyUpdateStart {
-                sender: *my_id,
-                modulus: p,
-                base: g,
-                public: my_public,
-            })
-            .await;
+        // ... e armazenar os valores, antes mesmo de enviar o pacote
+        {
+            let mut clients_w = other_clients.write().await;
+            if let Some(entry) = clients_w.get_mut(&client.id) {
+                entry.my_keys = (p, g, my_public, my_secret);
+                entry.their_pub = None; // invalidar qualquer chave publica anterior; iremos aguardar uma nova
+            } else {
+                // cliente desapareceu entre a cópia e o write..???
+                continue;
+            }
+        }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        roundtrip
-            .send_simple_packet(Packet::CipheredMessage {
-                sender: *my_id,
-                nickname: nickname.to_string(),
-                intended_receiver: client.id,
-                content_blob: message.as_bytes().to_vec(),
-            })
-            .await;
-    }
-
-    roundtrip
-        .send_simple_packet(Packet::CipheredMessage {
+        if let Err(_) = tx.send(Packet::KeyUpdateStart {
             sender: *my_id,
-            nickname: nickname.to_string(),
-            intended_receiver: Uuid::new_v4(),
-            content_blob: message.as_bytes().to_vec(),
-        })
-        .await;
+            modulus: p,
+            base: g,
+            public: my_public,
+        }) {
+            // envio falhou; ignorar
+            continue;
+        }
+
+        // aguardar até que o outro cliente responda com sua public key
+        let mut counter_ms = 0u64;
+        let timeout_max_ms = 3000u64;
+
+        loop {
+            // checar se o outro cliente setou their_pub
+            if let Some(entry) = other_clients.read().await.get(&client.id) {
+                if entry.their_pub.is_some() {
+                    break; // handshake concluído
+                }
+            } else {
+                // cliente saiu
+                break;
+            }
+
+            if counter_ms >= timeout_max_ms {
+                eprintln!("timeout aguardando KeyUpdateReply de {}", client.id);
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(50u64)).await;
+            counter_ms += 50u64;
+        }
+
+        // se o handshake concluiu, finalmente enviar mensagem cifrada
+        if let Some(entry) = other_clients.read().await.get(&client.id) {
+            if let Some(their_pub) = entry.their_pub {
+                let (modulus, _, _, my_secret) = entry.my_keys;
+                let our_shared_secret =
+                    diffie_hellman::compute_shared_secret(modulus, my_secret, their_pub);
+
+                let k = (our_shared_secret % 26).try_into().unwrap();
+                println!("encode key={}", our_shared_secret);
+                let encoded_message = Caesar::encrypt(k, &message.to_string());
+
+                println!("envio: {:?}, their_pub={}", entry.my_keys, their_pub);
+
+                let _ = tx.send(Packet::CipheredMessage {
+                    sender: *my_id,
+                    nickname: nickname.to_string(),
+                    intended_receiver: client.id,
+                    content_blob: encoded_message,
+                });
+            } else {
+                eprintln!(
+                    "não posso enviar ao cliente {}, as chaves não foram negociadas.",
+                    client.id
+                );
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -215,7 +287,9 @@ async fn main() -> anyhow::Result<()> {
     let mut reader = BufReader::new(tokio::io::stdin());
     let mut line = String::new();
 
-    let other_clients = tokio::sync::RwLock::new(HashMap::<ClientId, OtherClient>::new());
+    let other_clients = Arc::new(tokio::sync::RwLock::new(
+        HashMap::<ClientId, OtherClient>::new(),
+    ));
 
     loop {
         tokio::select! {
@@ -225,8 +299,16 @@ async fn main() -> anyhow::Result<()> {
                     break;
                 }
 
-                line = line.trim().to_string();
-                handle_message_send(&my_id, &nickname, &mut roundtrip, &other_clients, &line).await;
+                let s = line.trim().to_string();
+                // spawn the send work so that the select continues to poll roundtrip
+                let tx_clone = roundtrip.ch_sender.clone();
+                let other_clients_clone = other_clients.clone();
+                let my_id_clone = my_id.clone();
+                let nickname_clone = nickname.clone();
+                tokio::spawn(async move {
+                    handle_message_send(&my_id_clone, &nickname_clone, tx_clone, other_clients_clone, &s).await;
+                });
+
                 line.clear();
             }
         }
