@@ -138,11 +138,6 @@ async fn handle_connection_2(
     {
         let mut map = state.lock().await;
 
-        if map.len() == 2 {
-            map.clear();
-            // TODO remover
-        }
-
         let sc = ServerClient {
             id: client_id.clone(),
             nickname: nickname.clone(),
